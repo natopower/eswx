@@ -17,7 +17,7 @@ Drag the panel anywhere on the scope. Position is saved to the ASR file.
 1. Download `WeatherRadarPlugin.dll` from the [latest release](https://github.com/natopower/eswx/releases/latest)
 2. Copy it to your EuroScope plugins folder
 3. Load via **Other Set** → **Plug-ins** → **Add/Remove**
-4. The radar should enable automatically, using your vis points (.showvis will display your range(s)) to choose where to display radar data
+4. The radar should enable automatically, and detail of the radar depends on how zoomed in you are.
 
 ## Plugin Info
 
