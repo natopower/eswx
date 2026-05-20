@@ -41,7 +41,14 @@ Drag the panel anywhere on the scope. Position is saved to the ASR file.
 | `.eswx opacity <0-100>` | Set opacity |
 | `.eswx refresh` | Force frame refresh |
 
-## Building
+## Installation
+
+1. Download `WeatherRadarPlugin.dll` from the [latest release](https://github.com/natopower/eswx/releases/latest)
+2. Copy it to your EuroScope plugins folder
+3. Load via **Other Set** → **Plug-ins** → **Add/Remove**
+4. The radar activates automatically on any geo-referenced scope
+
+## Building from Source
 
 Requirements:
 - Visual Studio 2022 (or Build Tools v143)
@@ -50,14 +57,6 @@ Requirements:
 ```
 msbuild WeatherRadarPlugin.vcxproj /p:Configuration=Release /p:Platform=Win32
 ```
-
-Output: `Release\WeatherRadarPlugin.dll`
-
-## Installation
-
-1. Copy `WeatherRadarPlugin.dll` to your EuroScope plugins folder
-2. Load via **Other Set** → **Plug-ins** → **Add/Remove**
-3. The radar activates automatically on any geo-referenced scope
 
 ## Plugin Info
 
