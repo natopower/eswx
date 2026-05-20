@@ -47,7 +47,6 @@ public:
 
 private:
     std::vector<VisPoint> CollectVisPoints();
-    int CurrentZoom();
     static Gdiplus::Bitmap* DecodePng(const std::vector<uint8_t>& bytes);
     void FetchWorker();
     void DrawPanel(HDC hDC);
@@ -83,7 +82,6 @@ private:
 
     POINT m_btnPos{ -1, -1 };
     POINT m_dragOffset{ 0, 0 };
-    HWND  m_scopeHwnd{ nullptr };
 
     static constexpr const char* ASR_ENABLED  = "WxRadar_Enabled";
     static constexpr const char* ASR_OPACITY  = "WxRadar_Opacity";

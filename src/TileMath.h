@@ -52,9 +52,16 @@ inline std::set<TileCoord> TilesForCircle(double lat, double lon, double range_n
     auto [x1, y0] = LatLonToTile(lat - dlat, lon + dlon, z);
 
     std::set<TileCoord> tiles;
-    for (int tx = x0; tx <= x1; tx++)
-        for (int ty = y1; ty <= y0; ty++)
-            tiles.insert({ z, tx, ty });
+    for (int tx = x0; tx <= x1; tx++) {
+        for (int ty = y1; ty <= y0; ty++) {
+            auto [nwLat, nwLon] = TileNWCorner(tx,     ty,     z);
+            auto [seLat, seLon] = TileNWCorner(tx + 1, ty + 1, z);
+            double clampedLat = std::max(seLat, std::min(lat, nwLat));
+            double clampedLon = std::max(nwLon, std::min(lon, seLon));
+            if (DistanceNm(lat, lon, clampedLat, clampedLon) <= range_nm)
+                tiles.insert({ z, tx, ty });
+        }
+    }
     return tiles;
 }
 

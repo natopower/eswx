@@ -39,37 +39,20 @@ void WeatherRadarScreen::OnAsrContentToBeSaved() {
 }
 
 std::vector<VisPoint> WeatherRadarScreen::CollectVisPoints() {
-    std::vector<VisPoint> points;
-    EuroScopePlugIn::CController me = GetPlugIn()->ControllerMyself();
-    if (me.IsValid()) {
-        EuroScopePlugIn::CPosition pos = me.GetPosition();
-        int range = me.GetRange();
-        if ((pos.m_Latitude != 0.0 || pos.m_Longitude != 0.0) && range > 0)
-            points.push_back({ pos.m_Latitude, pos.m_Longitude, (double)range });
-    }
-    if (points.empty()) {
-        POINT mid{ 400, 300 };
-        EuroScopePlugIn::CPosition centre = ConvertCoordFromPixelToPosition(mid);
-        if (centre.m_Latitude != 0.0 || centre.m_Longitude != 0.0)
-            points.push_back({ centre.m_Latitude, centre.m_Longitude, 250.0 });
-    }
-    return points;
+    EuroScopePlugIn::CPosition ld, ru;
+    GetDisplayArea(&ld, &ru);
+    if ((ld.m_Latitude == 0.0 && ld.m_Longitude == 0.0) ||
+        (ru.m_Latitude == 0.0 && ru.m_Longitude == 0.0))
+        return {};
+    double centerLat = (ld.m_Latitude  + ru.m_Latitude)  / 2.0;
+    double centerLon = (ld.m_Longitude + ru.m_Longitude) / 2.0;
+    double rangeNm   = TileMath::DistanceNm(ld.m_Latitude, ld.m_Longitude,
+                                            ru.m_Latitude, ru.m_Longitude) / 2.0 + 30.0;
+    return {{ centerLat, centerLon, rangeNm }};
 }
 
-int WeatherRadarScreen::CurrentZoom() {
-    POINT pA{ 200, 300 }, pB{ 400, 300 };
-    EuroScopePlugIn::CPosition posA = ConvertCoordFromPixelToPosition(pA);
-    EuroScopePlugIn::CPosition posB = ConvertCoordFromPixelToPosition(pB);
-    if ((posA.m_Latitude == 0.0 && posA.m_Longitude == 0.0) ||
-        (posB.m_Latitude == 0.0 && posB.m_Longitude == 0.0)) return 6;
-    double nm = TileMath::DistanceNm(posA.m_Latitude, posA.m_Longitude,
-                                     posB.m_Latitude, posB.m_Longitude);
-    return TileMath::RangeToZoom(nm * 4.0);
-}
 
 void WeatherRadarScreen::OnRefresh(HDC hDC, int Phase) {
-    if (!m_scopeHwnd) m_scopeHwnd = WindowFromDC(hDC);
-
     if (Phase == EuroScopePlugIn::REFRESH_PHASE_AFTER_LISTS) {
         DrawPanel(hDC);
         return;
@@ -99,29 +82,14 @@ void WeatherRadarScreen::OnRefresh(HDC hDC, int Phase) {
     { std::lock_guard<std::mutex> lk(m_frameMu); ts = m_frameTimestamp; }
     if (ts == 0) return;
 
-    int zoom = CurrentZoom();
-
     std::vector<VisPoint> visPoints = CollectVisPoints();
-    if (visPoints.empty()) {
-        RECT clip{}; GetClipBox(hDC, &clip);
-        POINT corners[4] = {
-            {clip.left, clip.top}, {clip.right, clip.top},
-            {clip.left, clip.bottom}, {clip.right, clip.bottom}
-        };
-        double minLat = 90, maxLat = -90, minLon = 180, maxLon = -180;
-        bool anyValid = false;
-        for (auto& pt : corners) {
-            EuroScopePlugIn::CPosition p = ConvertCoordFromPixelToPosition(pt);
-            if (p.m_Latitude == 0.0 && p.m_Longitude == 0.0) continue;
-            minLat = std::min(minLat, p.m_Latitude); maxLat = std::max(maxLat, p.m_Latitude);
-            minLon = std::min(minLon, p.m_Longitude); maxLon = std::max(maxLon, p.m_Longitude);
-            anyValid = true;
-        }
-        if (anyValid) {
-            double rangeNm = TileMath::DistanceNm(minLat, minLon, maxLat, maxLon) / 2.0 + 50.0;
-            visPoints.push_back({ (minLat + maxLat) / 2.0, (minLon + maxLon) / 2.0, rangeNm });
-        }
-    }
+    if (visPoints.empty()) return;
+
+    EuroScopePlugIn::CPosition dispLD, dispRU;
+    GetDisplayArea(&dispLD, &dispRU);
+    double screenWidthNm = TileMath::DistanceNm(dispLD.m_Latitude, dispLD.m_Longitude,
+                                                 dispLD.m_Latitude, dispRU.m_Longitude);
+    int zoom = TileMath::RangeToZoom(screenWidthNm);
 
     std::set<TileCacheKey> neededKeys;
     for (auto& vp : visPoints) {
@@ -172,12 +140,12 @@ void WeatherRadarScreen::OnRefresh(HDC hDC, int Phase) {
                     Gdiplus::UnitPixel, &attrs);
     };
 
-    auto cachedTiles = m_tileCache.GetAllAtTimestamp(ts);
-    for (auto& [key, bmp] : cachedTiles)
-        renderTile(key, bmp);
+    for (auto& key : neededKeys) {
+        Gdiplus::Bitmap* bmp = m_tileCache.Get(key);
+        if (bmp) renderTile(key, bmp);
+    }
 
     m_tileCache.EvictOldTimestamps(ts);
-    DrawPanel(hDC);
 }
 
 void WeatherRadarScreen::DrawPanel(HDC hDC) {
@@ -263,7 +231,7 @@ void WeatherRadarScreen::OnClickScreenObject(int ObjectType, const char*,
         }
     }
 
-    if (m_scopeHwnd) InvalidateRect(m_scopeHwnd, nullptr, FALSE);
+    RequestRefresh();
 }
 
 void WeatherRadarScreen::OnMoveScreenObject(int ObjectType, const char*,
