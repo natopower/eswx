@@ -1,0 +1,399 @@
+#include "pch.h"
+#include "WeatherRadarScreen.h"
+#include <objidl.h>
+#include <gdiplus.h>
+#pragma comment(lib, "gdiplus.lib")
+
+WeatherRadarScreen::WeatherRadarScreen() {
+    Gdiplus::GdiplusStartupInput si;
+    Gdiplus::GdiplusStartup(&m_gdipToken, &si, nullptr);
+    for (int i = 0; i < WORKER_COUNT; ++i)
+        m_workers.emplace_back(&WeatherRadarScreen::FetchWorker, this);
+}
+
+WeatherRadarScreen::~WeatherRadarScreen() {
+    m_stopWorker = true;
+    m_fetchCv.notify_all();
+    for (auto& w : m_workers)
+        if (w.joinable()) w.join();
+    Gdiplus::GdiplusShutdown(m_gdipToken);
+}
+
+void WeatherRadarScreen::OnAsrContentLoaded(bool) {
+    const char* en = GetDataFromAsr(ASR_ENABLED);
+    const char* op = GetDataFromAsr(ASR_OPACITY);
+    const char* bx = GetDataFromAsr(ASR_BTN_X);
+    const char* by = GetDataFromAsr(ASR_BTN_Y);
+    if (en) m_enabled  = (strcmp(en, "1") == 0);
+    if (op) m_opacity  = std::max(0, std::min(100, atoi(op)));
+    if (bx) m_btnPos.x = atoi(bx);
+    if (by) m_btnPos.y = atoi(by);
+}
+
+void WeatherRadarScreen::OnAsrContentToBeSaved() {
+    SaveDataToAsr(ASR_ENABLED, "Weather Radar Enabled", m_enabled ? "1" : "0");
+    char buf[16];
+    sprintf_s(buf, "%d", (int)m_opacity); SaveDataToAsr(ASR_OPACITY, "Weather Radar Opacity", buf);
+    sprintf_s(buf, "%d", m_btnPos.x);     SaveDataToAsr(ASR_BTN_X,   "Weather Radar Button X", buf);
+    sprintf_s(buf, "%d", m_btnPos.y);     SaveDataToAsr(ASR_BTN_Y,   "Weather Radar Button Y", buf);
+}
+
+std::vector<VisPoint> WeatherRadarScreen::CollectVisPoints() {
+    std::vector<VisPoint> points;
+    EuroScopePlugIn::CController me = GetPlugIn()->ControllerMyself();
+    if (me.IsValid()) {
+        EuroScopePlugIn::CPosition pos = me.GetPosition();
+        int range = me.GetRange();
+        if ((pos.m_Latitude != 0.0 || pos.m_Longitude != 0.0) && range > 0)
+            points.push_back({ pos.m_Latitude, pos.m_Longitude, (double)range });
+    }
+    if (points.empty()) {
+        POINT mid{ 400, 300 };
+        EuroScopePlugIn::CPosition centre = ConvertCoordFromPixelToPosition(mid);
+        if (centre.m_Latitude != 0.0 || centre.m_Longitude != 0.0)
+            points.push_back({ centre.m_Latitude, centre.m_Longitude, 250.0 });
+    }
+    return points;
+}
+
+int WeatherRadarScreen::CurrentZoom() {
+    POINT pA{ 200, 300 }, pB{ 400, 300 };
+    EuroScopePlugIn::CPosition posA = ConvertCoordFromPixelToPosition(pA);
+    EuroScopePlugIn::CPosition posB = ConvertCoordFromPixelToPosition(pB);
+    if ((posA.m_Latitude == 0.0 && posA.m_Longitude == 0.0) ||
+        (posB.m_Latitude == 0.0 && posB.m_Longitude == 0.0)) return 6;
+    double nm = TileMath::DistanceNm(posA.m_Latitude, posA.m_Longitude,
+                                     posB.m_Latitude, posB.m_Longitude);
+    return TileMath::RangeToZoom(nm * 4.0);
+}
+
+void WeatherRadarScreen::OnRefresh(HDC hDC, int Phase) {
+    if (!m_scopeHwnd) m_scopeHwnd = WindowFromDC(hDC);
+
+    if (Phase == EuroScopePlugIn::REFRESH_PHASE_AFTER_LISTS) {
+        DrawPanel(hDC);
+        return;
+    }
+
+    if (Phase != EuroScopePlugIn::REFRESH_PHASE_BACK_BITMAP) return;
+    if (!m_enabled) return;
+
+    if (m_lastFrameFetch == 0 || m_forceFrameRefresh) {
+        TileCacheKey sentinel{ {-1, 0, 0}, 0 };
+        { std::lock_guard<std::mutex> lk(m_fetchMu); m_fetchQueue.push(sentinel); }
+        m_fetchCv.notify_one();
+        m_forceFrameRefresh = false;
+        m_lastFrameFetch = 1;
+    } else {
+        SYSTEMTIME st; GetSystemTime(&st);
+        long long nowSec = (long long)st.wHour * 3600 + st.wMinute * 60 + st.wSecond;
+        if (m_lastFrameFetch > 1 && nowSec - m_lastFrameFetch > FRAME_TTL_SEC) {
+            TileCacheKey sentinel{ {-1, 0, 0}, 0 };
+            { std::lock_guard<std::mutex> lk(m_fetchMu); m_fetchQueue.push(sentinel); }
+            m_fetchCv.notify_one();
+            m_lastFrameFetch = nowSec;
+        }
+    }
+
+    long long ts;
+    { std::lock_guard<std::mutex> lk(m_frameMu); ts = m_frameTimestamp; }
+    if (ts == 0) return;
+
+    int zoom = CurrentZoom();
+
+    std::vector<VisPoint> visPoints = CollectVisPoints();
+    if (visPoints.empty()) {
+        RECT clip{}; GetClipBox(hDC, &clip);
+        POINT corners[4] = {
+            {clip.left, clip.top}, {clip.right, clip.top},
+            {clip.left, clip.bottom}, {clip.right, clip.bottom}
+        };
+        double minLat = 90, maxLat = -90, minLon = 180, maxLon = -180;
+        bool anyValid = false;
+        for (auto& pt : corners) {
+            EuroScopePlugIn::CPosition p = ConvertCoordFromPixelToPosition(pt);
+            if (p.m_Latitude == 0.0 && p.m_Longitude == 0.0) continue;
+            minLat = std::min(minLat, p.m_Latitude); maxLat = std::max(maxLat, p.m_Latitude);
+            minLon = std::min(minLon, p.m_Longitude); maxLon = std::max(maxLon, p.m_Longitude);
+            anyValid = true;
+        }
+        if (anyValid) {
+            double rangeNm = TileMath::DistanceNm(minLat, minLon, maxLat, maxLon) / 2.0 + 50.0;
+            visPoints.push_back({ (minLat + maxLat) / 2.0, (minLon + maxLon) / 2.0, rangeNm });
+        }
+    }
+
+    std::set<TileCacheKey> neededKeys;
+    for (auto& vp : visPoints) {
+        auto tiles = TileMath::TilesForCircle(vp.lat, vp.lon, vp.range_nm, zoom);
+        for (auto& tc : tiles)
+            neededKeys.insert({ tc, ts });
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(m_fetchMu);
+        for (auto& key : neededKeys) {
+            if (!m_tileCache.Get(key) && !m_tileCache.IsPending(key) && !m_tileCache.IsFailed(key)) {
+                m_tileCache.MarkPending(key);
+                m_fetchQueue.push(key);
+            }
+        }
+    }
+    m_fetchCv.notify_all();
+
+    Gdiplus::Graphics g(hDC);
+    g.SetInterpolationMode(Gdiplus::InterpolationModeNearestNeighbor);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeNone);
+
+    BYTE alpha = (BYTE)(m_opacity * 255 / 100);
+    Gdiplus::ColorMatrix cm = {
+        1,0,0,0,0,
+        0,1,0,0,0,
+        0,0,1,0,0,
+        0,0,0,(float)alpha/255.0f,0,
+        0,0,0,0,1
+    };
+    Gdiplus::ImageAttributes attrs;
+    attrs.SetColorMatrix(&cm, Gdiplus::ColorMatrixFlagsDefault, Gdiplus::ColorAdjustTypeBitmap);
+
+    auto renderTile = [&](const TileCacheKey& key, Gdiplus::Bitmap* bmp) {
+        auto [nwLat, nwLon] = TileMath::TileNWCorner(key.coord.x,     key.coord.y,     key.coord.z);
+        auto [seLat, seLon] = TileMath::TileNWCorner(key.coord.x + 1, key.coord.y + 1, key.coord.z);
+        EuroScopePlugIn::CPosition posNW, posSE;
+        posNW.m_Latitude = nwLat; posNW.m_Longitude = nwLon;
+        posSE.m_Latitude = seLat; posSE.m_Longitude = seLon;
+        POINT ptNW = ConvertCoordFromPositionToPixel(posNW);
+        POINT ptSE = ConvertCoordFromPositionToPixel(posSE);
+        int w = ptSE.x - ptNW.x;
+        int h = ptSE.y - ptNW.y;
+        if (w <= 0 || h <= 0) return;
+        Gdiplus::Rect destRect(ptNW.x, ptNW.y, w, h);
+        g.DrawImage(bmp, destRect, 0, 0, bmp->GetWidth(), bmp->GetHeight(),
+                    Gdiplus::UnitPixel, &attrs);
+    };
+
+    auto cachedTiles = m_tileCache.GetAllAtTimestamp(ts);
+    for (auto& [key, bmp] : cachedTiles)
+        renderTile(key, bmp);
+
+    m_tileCache.EvictOldTimestamps(ts);
+    DrawPanel(hDC);
+}
+
+void WeatherRadarScreen::DrawPanel(HDC hDC) {
+    if (m_btnPos.x == -1) {
+        RECT clip{}; GetClipBox(hDC, &clip);
+        m_btnPos.x = clip.right  - BTN_W - 10;
+        m_btnPos.y = clip.bottom - BTN_H - 10;
+        if (m_btnPos.x < 0) m_btnPos.x = 10;
+        if (m_btnPos.y < 0) m_btnPos.y = 10;
+    }
+
+    const int x0 = m_btnPos.x;
+    const int y0 = m_btnPos.y;
+
+    auto fillSection = [&](int xOff, int w, COLORREF bg) {
+        RECT rc{ x0 + xOff, y0, x0 + xOff + w, y0 + BTN_H };
+        HBRUSH hBr = CreateSolidBrush(bg);
+        FillRect(hDC, &rc, hBr);
+        DeleteObject(hBr);
+    };
+
+    fillSection(0,                    BTN_W_WX, m_enabled ? RGB(0, 160, 60) : RGB(55, 55, 55));
+    fillSection(BTN_W_WX,             BTN_W_OP, RGB(40, 40, 40));
+    fillSection(BTN_W_WX + BTN_W_OP,  BTN_W_RF, RGB(30, 80, 150));
+
+    HPEN hPen = CreatePen(PS_SOLID, 1, RGB(160, 160, 160));
+    HPEN hOld = (HPEN)SelectObject(hDC, hPen);
+    RECT full{ x0, y0, x0 + BTN_W, y0 + BTN_H };
+    MoveToEx(hDC, full.left,      full.top,        nullptr);
+    LineTo  (hDC, full.right - 1, full.top);
+    LineTo  (hDC, full.right - 1, full.bottom - 1);
+    LineTo  (hDC, full.left,      full.bottom - 1);
+    LineTo  (hDC, full.left,      full.top);
+    MoveToEx(hDC, x0 + BTN_W_WX,            y0, nullptr); LineTo(hDC, x0 + BTN_W_WX,            y0 + BTN_H);
+    MoveToEx(hDC, x0 + BTN_W_WX + BTN_W_OP, y0, nullptr); LineTo(hDC, x0 + BTN_W_WX + BTN_W_OP, y0 + BTN_H);
+    SelectObject(hDC, hOld);
+    DeleteObject(hPen);
+
+    SetBkMode(hDC, TRANSPARENT);
+    SetTextColor(hDC, RGB(255, 255, 255));
+
+    RECT rcWX  { x0,                          y0, x0 + BTN_W_WX,              y0 + BTN_H };
+    RECT rcOP  { x0 + BTN_W_WX,               y0, x0 + BTN_W_WX + BTN_W_OP,  y0 + BTN_H };
+    RECT rcRF  { x0 + BTN_W_WX + BTN_W_OP,    y0, x0 + BTN_W,                y0 + BTN_H };
+
+    DrawTextA(hDC, "WX", 2, &rcWX, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    char opBuf[8];
+    sprintf_s(opBuf, "%d%%", (int)m_opacity);
+    DrawTextA(hDC, opBuf, -1, &rcOP, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    DrawTextA(hDC, "RF", 2, &rcRF, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    AddScreenObject(BTN_OBJECT_TYPE, "WxPanel", full, true, "");
+}
+
+void WeatherRadarScreen::OnButtonDownScreenObject(int ObjectType, const char*,
+                                                   POINT Pt, RECT Area, int) {
+    if (ObjectType != BTN_OBJECT_TYPE) return;
+    m_dragOffset.x = Pt.x - Area.left;
+    m_dragOffset.y = Pt.y - Area.top;
+}
+
+void WeatherRadarScreen::OnClickScreenObject(int ObjectType, const char*,
+                                              POINT Pt, RECT Area, int Button) {
+    if (ObjectType != BTN_OBJECT_TYPE) return;
+
+    int relX = Pt.x - Area.left;
+
+    if (Button == EuroScopePlugIn::BUTTON_LEFT) {
+        if (relX < BTN_W_WX) {
+            m_enabled = !m_enabled;
+        } else if (relX < BTN_W_WX + BTN_W_OP) {
+            int newOp = (int)m_opacity - 10;
+            m_opacity = std::max(0, std::min(100, newOp));
+        } else {
+            m_forceFrameRefresh = true;
+        }
+    } else if (Button == EuroScopePlugIn::BUTTON_RIGHT) {
+        if (relX >= BTN_W_WX && relX < BTN_W_WX + BTN_W_OP) {
+            int newOp = (int)m_opacity + 10;
+            m_opacity = std::max(0, std::min(100, newOp));
+        }
+    }
+
+    if (m_scopeHwnd) InvalidateRect(m_scopeHwnd, nullptr, FALSE);
+}
+
+void WeatherRadarScreen::OnMoveScreenObject(int ObjectType, const char*,
+                                             POINT Pt, RECT, bool Released) {
+    if (ObjectType != BTN_OBJECT_TYPE) return;
+    m_btnPos.x = std::max(0L, Pt.x - m_dragOffset.x);
+    m_btnPos.y = std::max(0L, Pt.y - m_dragOffset.y);
+    (void)Released;
+}
+
+static float HueToRadarIntensity(float h) {
+    static const struct { float h, i; } pts[] = {
+        {   0, 0.80f }, {  30, 0.65f }, {  60, 0.50f },
+        { 120, 0.30f }, { 180, 0.05f }, { 240, 0.15f },
+        { 300, 1.00f }, { 360, 0.80f }
+    };
+    for (int k = 0; k < 7; ++k) {
+        if (h <= pts[k + 1].h) {
+            float t = (h - pts[k].h) / (pts[k + 1].h - pts[k].h);
+            return pts[k].i + t * (pts[k + 1].i - pts[k].i);
+        }
+    }
+    return 0.5f;
+}
+
+static void RemapToBlue(Gdiplus::Bitmap* bmp) {
+    Gdiplus::BitmapData bd{};
+    Gdiplus::Rect r(0, 0, (INT)bmp->GetWidth(), (INT)bmp->GetHeight());
+    if (bmp->LockBits(&r, Gdiplus::ImageLockModeRead | Gdiplus::ImageLockModeWrite, PixelFormat32bppARGB, &bd) != Gdiplus::Ok)
+        return;
+
+    BYTE* rows = reinterpret_cast<BYTE*>(bd.Scan0);
+    for (UINT y = 0; y < bd.Height; ++y) {
+        BYTE* px = rows + y * bd.Stride;
+        for (UINT x = 0; x < bd.Width; ++x, px += 4) {
+            if (px[3] < 5) continue;
+
+            float rf = px[2] / 255.0f;
+            float gf = px[1] / 255.0f;
+            float bf = px[0] / 255.0f;
+
+            float maxC = std::max({ rf, gf, bf });
+            float minC = std::min({ rf, gf, bf });
+            float delta = maxC - minC;
+
+            float intensity = 0.25f;
+            if (delta > 0.05f) {
+                float h;
+                if      (maxC == rf) h = 60.0f * fmodf((gf - bf) / delta, 6.0f);
+                else if (maxC == gf) h = 60.0f * ((bf - rf) / delta + 2.0f);
+                else                 h = 60.0f * ((rf - gf) / delta + 4.0f);
+                if (h < 0.0f) h += 360.0f;
+                intensity = HueToRadarIntensity(h);
+            }
+
+            float v = 0.90f - intensity * 0.75f;  // brightness: 0.9 (light) → 0.15 (heavy)
+            px[2] = (BYTE)(0.20f * v * 255.0f);   // R
+            px[1] = (BYTE)(0.60f * v * 255.0f);   // G
+            px[0] = (BYTE)(1.00f * v * 255.0f);   // B
+        }
+    }
+    bmp->UnlockBits(&bd);
+}
+
+Gdiplus::Bitmap* WeatherRadarScreen::DecodePng(const std::vector<uint8_t>& bytes) {
+    if (bytes.empty()) return nullptr;
+
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes.size());
+    if (!hMem) return nullptr;
+    void* p = GlobalLock(hMem);
+    if (!p) { GlobalFree(hMem); return nullptr; }
+    memcpy(p, bytes.data(), bytes.size());
+    GlobalUnlock(hMem);
+
+    IStream* stream = nullptr;
+    if (CreateStreamOnHGlobal(hMem, TRUE, &stream) != S_OK) { GlobalFree(hMem); return nullptr; }
+
+    Gdiplus::Bitmap* bmp = Gdiplus::Bitmap::FromStream(stream);
+    stream->Release();
+
+    if (!bmp || bmp->GetLastStatus() != Gdiplus::Ok) { delete bmp; return nullptr; }
+
+    Gdiplus::BitmapData bd{};
+    Gdiplus::Rect r(0, 0, (INT)bmp->GetWidth(), (INT)bmp->GetHeight());
+    if (bmp->LockBits(&r, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bd) == Gdiplus::Ok) {
+        bool hasData = false;
+        const BYTE* rows = reinterpret_cast<const BYTE*>(bd.Scan0);
+        for (UINT y = 0; y < bd.Height && !hasData; ++y) {
+            const BYTE* px = rows + y * bd.Stride;
+            for (UINT x = 0; x < bd.Width && !hasData; ++x, px += 4)
+                if (px[3] > 4) hasData = true;
+        }
+        bmp->UnlockBits(&bd);
+        if (!hasData) { delete bmp; return nullptr; }
+    }
+
+    RemapToBlue(bmp);
+    return bmp;
+}
+
+void WeatherRadarScreen::FetchWorker() {
+    while (true) {
+        TileCacheKey key;
+        {
+            std::unique_lock<std::mutex> lk(m_fetchMu);
+            m_fetchCv.wait(lk, [&] { return m_stopWorker || !m_fetchQueue.empty(); });
+            if (m_stopWorker && m_fetchQueue.empty()) break;
+            key = m_fetchQueue.front();
+            m_fetchQueue.pop();
+        }
+
+        if (key.coord.z == -1) {
+            if (m_rainViewer.FetchLatestFrame()) {
+                std::lock_guard<std::mutex> lk(m_frameMu);
+                m_frameTimestamp = m_rainViewer.Frame().time;
+                m_framePath      = m_rainViewer.Frame().path;
+                SYSTEMTIME st; GetSystemTime(&st);
+                m_lastFrameFetch = (long long)st.wHour * 3600 + st.wMinute * 60 + st.wSecond;
+                GetPlugIn()->DisplayUserMessage("Weather Radar", "Info",
+                    "Radar frame updated.", true, false, false, false, false);
+            } else {
+                GetPlugIn()->DisplayUserMessage("Weather Radar", "Warn",
+                    "Failed to fetch radar frame.", true, false, false, false, false);
+            }
+            continue;
+        }
+
+        std::string url = m_rainViewer.TileUrl(key.coord.z, key.coord.x, key.coord.y);
+        if (url.empty()) { m_tileCache.Insert(key, nullptr); continue; }
+        auto bytes = m_rainViewer.FetchTileBytes(url);
+        m_tileCache.Insert(key, DecodePng(bytes));
+    }
+}

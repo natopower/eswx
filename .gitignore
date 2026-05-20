@@ -1,0 +1,25 @@
+# Build output
+Release/
+Debug/
+x64/
+x86/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.aps
+*.ncb
+*.sdf
+*.opensdf
+*.cachefile
+ipch/
+*.ilk
+*.pdb
+*.exp
+*.lib
+
+# SDK — EuroScopePlugInDll.lib must be generated locally from your EuroScope install.
+# See BUILD.md for instructions. EuroScopePlugIn.h is included as it is freely available.
+SDK/EuroScopePlugInDll.lib
+SDK/EuroScopePlugInDll.def
