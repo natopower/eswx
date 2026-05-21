@@ -4,6 +4,13 @@
 #include <gdiplus.h>
 #pragma comment(lib, "gdiplus.lib")
 
+static long long UnixTimeSec() {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    ULONGLONG ull = ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    return (long long)(ull / 10000000ULL) - 11644473600LL;
+}
+
 WeatherRadarScreen::WeatherRadarScreen() {
     Gdiplus::GdiplusStartupInput si;
     Gdiplus::GdiplusStartup(&m_gdipToken, &si, nullptr);
@@ -70,8 +77,7 @@ void WeatherRadarScreen::OnRefresh(HDC hDC, int Phase) {
     if (Phase != EuroScopePlugIn::REFRESH_PHASE_BACK_BITMAP) return;
     if (!m_enabled) return;
 
-    SYSTEMTIME _st; GetSystemTime(&_st);
-    long long nowSec = (long long)_st.wHour * 3600 + _st.wMinute * 60 + _st.wSecond;
+    long long nowSec = UnixTimeSec();
 
     if (m_lastFrameFetch == 0 || m_forceFrameRefresh) {
         TileCacheKey sentinel{ {-1, 0, 0}, 0 };
@@ -424,8 +430,7 @@ void WeatherRadarScreen::FetchWorker() {
                     m_framePath      = m_rainViewer.Frame().path;
                 }
                 m_tileCache.ClearFailed();
-                SYSTEMTIME st; GetSystemTime(&st);
-                m_lastFrameFetch = (long long)st.wHour * 3600 + st.wMinute * 60 + st.wSecond;
+                m_lastFrameFetch = UnixTimeSec();
                 char msg[192];
                 sprintf_s(msg, "Radar frame updated. Lightning: %s.",
                     m_lightningFeed.GetStatus().c_str());
