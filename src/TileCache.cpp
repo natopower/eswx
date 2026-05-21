@@ -46,6 +46,14 @@ std::vector<std::pair<TileCacheKey, Gdiplus::Bitmap*>> TileCache::GetAllAtTimest
     return out;
 }
 
+void TileCache::ClearFailed() {
+    std::lock_guard<std::mutex> lk(m_mu);
+    for (auto it = m_tiles.begin(); it != m_tiles.end(); ) {
+        if (it->second.failed) it = m_tiles.erase(it);
+        else ++it;
+    }
+}
+
 void TileCache::EvictOldTimestamps(long long ts) {
     std::lock_guard<std::mutex> lk(m_mu);
     for (auto it = m_tiles.begin(); it != m_tiles.end(); ) {

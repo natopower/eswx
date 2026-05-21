@@ -1,6 +1,9 @@
 #pragma once
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#define _WIN32_WINNT 0x0A00  // Windows 10 — required for WinHTTP WebSocket APIs
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <objidl.h>
 #include <gdiplus.h>
@@ -8,6 +11,7 @@
 #include <vector>
 #include <map>
 #include <set>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <atomic>

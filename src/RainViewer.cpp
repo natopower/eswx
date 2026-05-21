@@ -3,34 +3,17 @@
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
 
-static long long ParseFirstIntAfter(const std::string& s, const std::string& key) {
-    auto pos = s.find(key);
-    if (pos == std::string::npos) return 0;
-    pos += key.size();
-    while (pos < s.size() && (s[pos] == ' ' || s[pos] == ':')) pos++;
-    auto end = s.find_first_of(",} \t\r\n", pos);
-    if (end == std::string::npos) end = s.size();
-    try { return std::stoll(s.substr(pos, end - pos)); } catch (...) { return 0; }
-}
-
-bool RainViewer::FetchLatestFrame() {
-    std::string body = HttpGetText(L"api.rainviewer.com", L"/public/weather-maps.json");
-    if (body.empty()) return false;
-
-    auto pastStart = body.find("\"past\"");
-    if (pastStart == std::string::npos) return false;
-    auto pastEnd = body.find(']', pastStart);
-    if (pastEnd == std::string::npos) return false;
-
+// Parse the most-recent {time, path} pair from a JSON array slice.
+static bool ParseLatestEntry(const std::string& body, size_t start, size_t end,
+                              long long& outTime, std::string& outPath) {
     long long bestTime = 0;
     std::string bestPath;
-
-    size_t cursor = pastStart;
-    while (cursor < pastEnd) {
+    size_t cursor = start;
+    while (cursor < end) {
         auto tpos = body.find("\"time\"", cursor);
-        if (tpos == std::string::npos || tpos >= pastEnd) break;
+        if (tpos == std::string::npos || tpos >= end) break;
         auto ppos = body.find("\"path\"", tpos);
-        if (ppos == std::string::npos || ppos >= pastEnd) break;
+        if (ppos == std::string::npos || ppos >= end) break;
 
         size_t tval = tpos + 7;
         while (tval < body.size() && body[tval] == ' ') tval++;
@@ -44,11 +27,44 @@ bool RainViewer::FetchLatestFrame() {
         std::string pp = (pvalEnd != std::string::npos) ? body.substr(pval, pvalEnd - pval) : "";
 
         if (tt > bestTime && !pp.empty()) { bestTime = tt; bestPath = pp; }
-        cursor = (pvalEnd != std::string::npos) ? pvalEnd + 1 : pastEnd;
+        cursor = (pvalEnd != std::string::npos) ? pvalEnd + 1 : end;
+    }
+    if (bestPath.empty()) return false;
+    outTime = bestTime; outPath = bestPath;
+    return true;
+}
+
+bool RainViewer::FetchLatestFrame() {
+    std::string body = HttpGetText(L"api.rainviewer.com", L"/public/weather-maps.json");
+    if (body.empty()) return false;
+
+    // Radar — required
+    auto pastStart = body.find("\"past\"");
+    if (pastStart == std::string::npos) return false;
+    auto pastEnd = body.find(']', pastStart);
+    if (pastEnd == std::string::npos) return false;
+    long long t = 0; std::string p;
+    if (!ParseLatestEntry(body, pastStart, pastEnd, t, p)) return false;
+    m_frame = { t, p };
+
+    // Lightning density tiles — optional, same response
+    m_lightningFrame = {};
+    auto lxPos = body.find("\"lightning\"");
+    if (lxPos != std::string::npos) {
+        // Section may be a direct array or have a nested "past" key
+        size_t arrStart = body.find('[', lxPos);
+        size_t pastKey  = body.find("\"past\"", lxPos);
+        size_t searchFrom = (pastKey != std::string::npos && pastKey < arrStart) ? pastKey : arrStart;
+        if (searchFrom != std::string::npos) {
+            size_t lxEnd = body.find(']', searchFrom);
+            if (lxEnd != std::string::npos) {
+                long long lt = 0; std::string lp;
+                if (ParseLatestEntry(body, searchFrom, lxEnd, lt, lp))
+                    m_lightningFrame = { lt, lp };
+            }
+        }
     }
 
-    if (bestPath.empty()) return false;
-    m_frame = { bestTime, bestPath };
     return true;
 }
 
@@ -57,6 +73,14 @@ std::string RainViewer::TileUrl(int z, int x, int y) const {
     std::ostringstream ss;
     ss << "https://tilecache.rainviewer.com" << m_frame.path
        << "/256/" << z << "/" << x << "/" << y << "/6/0_0.png";
+    return ss.str();
+}
+
+std::string RainViewer::LightningTileUrl(int z, int x, int y) const {
+    if (!HasLightningFrame()) return {};
+    std::ostringstream ss;
+    ss << "https://tilecache.rainviewer.com" << m_lightningFrame.path
+       << "/256/" << z << "/" << x << "/" << y << "/0/0_0.png";
     return ss.str();
 }
 

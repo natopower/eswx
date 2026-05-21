@@ -7,6 +7,7 @@
 WeatherRadarScreen::WeatherRadarScreen() {
     Gdiplus::GdiplusStartupInput si;
     Gdiplus::GdiplusStartup(&m_gdipToken, &si, nullptr);
+    m_lightningFeed.Start();
     for (int i = 0; i < WORKER_COUNT; ++i)
         m_workers.emplace_back(&WeatherRadarScreen::FetchWorker, this);
 }
@@ -16,6 +17,7 @@ WeatherRadarScreen::~WeatherRadarScreen() {
     m_fetchCv.notify_all();
     for (auto& w : m_workers)
         if (w.joinable()) w.join();
+    m_lightningFeed.Stop();
     Gdiplus::GdiplusShutdown(m_gdipToken);
 }
 
@@ -28,10 +30,13 @@ void WeatherRadarScreen::OnAsrContentLoaded(bool) {
     if (op) m_opacity  = std::max(0, std::min(100, atoi(op)));
     if (bx) m_btnPos.x = atoi(bx);
     if (by) m_btnPos.y = atoi(by);
+    const char* lx = GetDataFromAsr(ASR_LIGHTNING);
+    if (lx) m_lightningEnabled = (strcmp(lx, "1") == 0);
 }
 
 void WeatherRadarScreen::OnAsrContentToBeSaved() {
-    SaveDataToAsr(ASR_ENABLED, "Weather Radar Enabled", m_enabled ? "1" : "0");
+    SaveDataToAsr(ASR_ENABLED,   "Weather Radar Enabled",   m_enabled          ? "1" : "0");
+    SaveDataToAsr(ASR_LIGHTNING, "Weather Radar Lightning",  m_lightningEnabled ? "1" : "0");
     char buf[16];
     sprintf_s(buf, "%d", (int)m_opacity); SaveDataToAsr(ASR_OPACITY, "Weather Radar Opacity", buf);
     sprintf_s(buf, "%d", m_btnPos.x);     SaveDataToAsr(ASR_BTN_X,   "Weather Radar Button X", buf);
@@ -57,9 +62,16 @@ void WeatherRadarScreen::OnRefresh(HDC hDC, int Phase) {
         DrawPanel(hDC);
         return;
     }
+    if (Phase == EuroScopePlugIn::REFRESH_PHASE_BEFORE_TAGS) {
+        if (m_lightningEnabled) DrawLightningStrikes(hDC);
+        return;
+    }
 
     if (Phase != EuroScopePlugIn::REFRESH_PHASE_BACK_BITMAP) return;
     if (!m_enabled) return;
+
+    SYSTEMTIME _st; GetSystemTime(&_st);
+    long long nowSec = (long long)_st.wHour * 3600 + _st.wMinute * 60 + _st.wSecond;
 
     if (m_lastFrameFetch == 0 || m_forceFrameRefresh) {
         TileCacheKey sentinel{ {-1, 0, 0}, 0 };
@@ -67,14 +79,31 @@ void WeatherRadarScreen::OnRefresh(HDC hDC, int Phase) {
         m_fetchCv.notify_one();
         m_forceFrameRefresh = false;
         m_lastFrameFetch = 1;
+        m_lastTileRetry  = nowSec;
     } else {
-        SYSTEMTIME st; GetSystemTime(&st);
-        long long nowSec = (long long)st.wHour * 3600 + st.wMinute * 60 + st.wSecond;
         if (m_lastFrameFetch > 1 && nowSec - m_lastFrameFetch > FRAME_TTL_SEC) {
             TileCacheKey sentinel{ {-1, 0, 0}, 0 };
             { std::lock_guard<std::mutex> lk(m_fetchMu); m_fetchQueue.push(sentinel); }
             m_fetchCv.notify_one();
             m_lastFrameFetch = nowSec;
+        }
+        // Retry failed tiles every 60 s so transient network errors self-heal
+        if (m_lastTileRetry > 0 && nowSec - m_lastTileRetry > TILE_RETRY_SEC) {
+            m_tileCache.ClearFailed();
+            m_lastTileRetry = nowSec;
+        }
+        if (m_lastTileRetry == 0) m_lastTileRetry = nowSec;
+    }
+
+    // Log any lightning status change automatically so it's visible without RF
+    {
+        std::string lxStatus = m_lightningFeed.GetStatus();
+        if (lxStatus != m_lastLightningStatus) {
+            m_lastLightningStatus = lxStatus;
+            char lxMsg[256];
+            sprintf_s(lxMsg, "Lightning status: %s", lxStatus.c_str());
+            GetPlugIn()->DisplayUserMessage("Weather Radar", "Info",
+                lxMsg, true, false, false, false, false);
         }
     }
 
@@ -167,9 +196,10 @@ void WeatherRadarScreen::DrawPanel(HDC hDC) {
         DeleteObject(hBr);
     };
 
-    fillSection(0,                    BTN_W_WX, m_enabled ? RGB(0, 160, 60) : RGB(55, 55, 55));
-    fillSection(BTN_W_WX,             BTN_W_OP, RGB(40, 40, 40));
-    fillSection(BTN_W_WX + BTN_W_OP,  BTN_W_RF, RGB(30, 80, 150));
+    fillSection(0,                              BTN_W_WX, m_enabled          ? RGB(0, 160, 60)   : RGB(55, 55, 55));
+    fillSection(BTN_W_WX,                       BTN_W_OP, RGB(40, 40, 40));
+    fillSection(BTN_W_WX + BTN_W_OP,            BTN_W_RF, RGB(30, 80, 150));
+    fillSection(BTN_W_WX + BTN_W_OP + BTN_W_RF, BTN_W_LX, m_lightningEnabled ? RGB(160, 140, 0) : RGB(55, 55, 55));
 
     HPEN hPen = CreatePen(PS_SOLID, 1, RGB(160, 160, 160));
     HPEN hOld = (HPEN)SelectObject(hDC, hPen);
@@ -179,17 +209,19 @@ void WeatherRadarScreen::DrawPanel(HDC hDC) {
     LineTo  (hDC, full.right - 1, full.bottom - 1);
     LineTo  (hDC, full.left,      full.bottom - 1);
     LineTo  (hDC, full.left,      full.top);
-    MoveToEx(hDC, x0 + BTN_W_WX,            y0, nullptr); LineTo(hDC, x0 + BTN_W_WX,            y0 + BTN_H);
-    MoveToEx(hDC, x0 + BTN_W_WX + BTN_W_OP, y0, nullptr); LineTo(hDC, x0 + BTN_W_WX + BTN_W_OP, y0 + BTN_H);
+    MoveToEx(hDC, x0 + BTN_W_WX,                       y0, nullptr); LineTo(hDC, x0 + BTN_W_WX,                       y0 + BTN_H);
+    MoveToEx(hDC, x0 + BTN_W_WX + BTN_W_OP,            y0, nullptr); LineTo(hDC, x0 + BTN_W_WX + BTN_W_OP,            y0 + BTN_H);
+    MoveToEx(hDC, x0 + BTN_W_WX + BTN_W_OP + BTN_W_RF, y0, nullptr); LineTo(hDC, x0 + BTN_W_WX + BTN_W_OP + BTN_W_RF, y0 + BTN_H);
     SelectObject(hDC, hOld);
     DeleteObject(hPen);
 
     SetBkMode(hDC, TRANSPARENT);
     SetTextColor(hDC, RGB(255, 255, 255));
 
-    RECT rcWX  { x0,                          y0, x0 + BTN_W_WX,              y0 + BTN_H };
-    RECT rcOP  { x0 + BTN_W_WX,               y0, x0 + BTN_W_WX + BTN_W_OP,  y0 + BTN_H };
-    RECT rcRF  { x0 + BTN_W_WX + BTN_W_OP,    y0, x0 + BTN_W,                y0 + BTN_H };
+    RECT rcWX  { x0,                                          y0, x0 + BTN_W_WX,                              y0 + BTN_H };
+    RECT rcOP  { x0 + BTN_W_WX,                               y0, x0 + BTN_W_WX + BTN_W_OP,                  y0 + BTN_H };
+    RECT rcRF  { x0 + BTN_W_WX + BTN_W_OP,                    y0, x0 + BTN_W_WX + BTN_W_OP + BTN_W_RF,       y0 + BTN_H };
+    RECT rcLX  { x0 + BTN_W_WX + BTN_W_OP + BTN_W_RF,         y0, x0 + BTN_W,                                y0 + BTN_H };
 
     DrawTextA(hDC, "WX", 2, &rcWX, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
@@ -198,6 +230,7 @@ void WeatherRadarScreen::DrawPanel(HDC hDC) {
     DrawTextA(hDC, opBuf, -1, &rcOP, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
     DrawTextA(hDC, "RF", 2, &rcRF, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    DrawTextA(hDC, "LX", 2, &rcLX, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
     AddScreenObject(BTN_OBJECT_TYPE, "WxPanel", full, true, "");
 }
@@ -214,23 +247,34 @@ void WeatherRadarScreen::OnClickScreenObject(int ObjectType, const char*,
     if (ObjectType != BTN_OBJECT_TYPE) return;
 
     int relX = Pt.x - Area.left;
+    bool backgroundChanged = false;
 
     if (Button == EuroScopePlugIn::BUTTON_LEFT) {
         if (relX < BTN_W_WX) {
             m_enabled = !m_enabled;
+            backgroundChanged = true;
         } else if (relX < BTN_W_WX + BTN_W_OP) {
             int newOp = (int)m_opacity - 10;
             m_opacity = std::max(0, std::min(100, newOp));
-        } else {
+            backgroundChanged = true;
+        } else if (relX < BTN_W_WX + BTN_W_OP + BTN_W_RF) {
+            m_tileCache.ClearFailed();
             m_forceFrameRefresh = true;
+            backgroundChanged = true;
+            GetPlugIn()->DisplayUserMessage("Weather Radar", "Info",
+                "Refresh requested.", true, false, false, false, false);
+        } else {
+            m_lightningEnabled = !m_lightningEnabled;
         }
     } else if (Button == EuroScopePlugIn::BUTTON_RIGHT) {
         if (relX >= BTN_W_WX && relX < BTN_W_WX + BTN_W_OP) {
             int newOp = (int)m_opacity + 10;
             m_opacity = std::max(0, std::min(100, newOp));
+            backgroundChanged = true;
         }
     }
 
+    if (backgroundChanged) RefreshMapContent();
     RequestRefresh();
 }
 
@@ -332,6 +376,35 @@ Gdiplus::Bitmap* WeatherRadarScreen::DecodePng(const std::vector<uint8_t>& bytes
     return bmp;
 }
 
+void WeatherRadarScreen::DrawLightningStrikes(HDC hDC) {
+    long long nowMs = LightningFeed::UnixTimeMs();
+    auto strikes = m_lightningFeed.Snapshot(nowMs);
+    if (strikes.empty()) return;
+
+    Gdiplus::Graphics g(hDC);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeNone);
+
+    BYTE alpha = (BYTE)(m_opacity * 255 / 100);
+    Gdiplus::Pen pen(Gdiplus::Color(alpha, 255, 255, 255), 1.0f);
+
+    for (auto& s : strikes) {
+        long long ageMs = nowMs - s.timeMs;
+        if (ageMs < 0) ageMs = 0;
+        int bucket = (int)(ageMs * 5 / LightningFeed::STRIKE_TTL_MS);
+        if (bucket < 0) bucket = 0;
+        if (bucket > 4) bucket = 4;
+
+        EuroScopePlugIn::CPosition pos;
+        pos.m_Latitude  = s.lat;
+        pos.m_Longitude = s.lon;
+        POINT pt = ConvertCoordFromPositionToPixel(pos);
+
+        int sz = 5 - bucket;
+        g.DrawLine(&pen, pt.x - sz, pt.y, pt.x + sz + 1, pt.y);
+        g.DrawLine(&pen, pt.x, pt.y - sz, pt.x, pt.y + sz + 1);
+    }
+}
+
 void WeatherRadarScreen::FetchWorker() {
     while (true) {
         TileCacheKey key;
@@ -345,13 +418,19 @@ void WeatherRadarScreen::FetchWorker() {
 
         if (key.coord.z == -1) {
             if (m_rainViewer.FetchLatestFrame()) {
-                std::lock_guard<std::mutex> lk(m_frameMu);
-                m_frameTimestamp = m_rainViewer.Frame().time;
-                m_framePath      = m_rainViewer.Frame().path;
+                {
+                    std::lock_guard<std::mutex> lk(m_frameMu);
+                    m_frameTimestamp = m_rainViewer.Frame().time;
+                    m_framePath      = m_rainViewer.Frame().path;
+                }
+                m_tileCache.ClearFailed();
                 SYSTEMTIME st; GetSystemTime(&st);
                 m_lastFrameFetch = (long long)st.wHour * 3600 + st.wMinute * 60 + st.wSecond;
+                char msg[192];
+                sprintf_s(msg, "Radar frame updated. Lightning: %s.",
+                    m_lightningFeed.GetStatus().c_str());
                 GetPlugIn()->DisplayUserMessage("Weather Radar", "Info",
-                    "Radar frame updated.", true, false, false, false, false);
+                    msg, true, false, false, false, false);
             } else {
                 GetPlugIn()->DisplayUserMessage("Weather Radar", "Warn",
                     "Failed to fetch radar frame.", true, false, false, false, false);

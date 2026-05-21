@@ -29,6 +29,7 @@ public:
     bool IsFailed(const TileCacheKey& key) const;
 
     void EvictOldTimestamps(long long ts);
+    void ClearFailed();
     std::vector<std::pair<TileCacheKey, Gdiplus::Bitmap*>> GetAllAtTimestamp(long long ts) const;
 
 private:
