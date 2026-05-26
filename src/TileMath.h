@@ -69,9 +69,7 @@ inline int RangeToZoom(double range_nm) {
     if (range_nm > 600) return 4;
     if (range_nm > 300) return 5;
     if (range_nm > 150) return 6;
-    if (range_nm > 75)  return 7;
-    if (range_nm > 35)  return 8;
-    return 9;
+    return 7;
 }
 
 }
