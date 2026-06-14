@@ -11,10 +11,6 @@
 #include <mutex>
 #include <condition_variable>
 
-struct VisPoint {
-    double lat, lon;
-    double range_nm;
-};
 
 class WeatherRadarScreen : public EuroScopePlugIn::CRadarScreen {
 public:
@@ -47,7 +43,7 @@ public:
     int  GetOpacity() const { return m_opacity; }
 
 private:
-    std::vector<VisPoint> CollectVisPoints();
+    bool HasValidDisplayArea(EuroScopePlugIn::CPosition& ld, EuroScopePlugIn::CPosition& ru);
     static Gdiplus::Bitmap* DecodePng(const std::vector<uint8_t>& bytes);
     void FetchWorker();
     void DrawPanel(HDC hDC);

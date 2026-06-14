@@ -43,25 +43,14 @@ inline double DistanceNm(double lat1, double lon1, double lat2, double lon2) {
     return 2.0 * atan2(sqrt(a), sqrt(1.0 - a)) * 3440.065;
 }
 
-inline std::set<TileCoord> TilesForCircle(double lat, double lon, double range_nm, int z) {
-    double dlat = range_nm / 60.0;
-    double cos_lat = cos(lat * PI / 180.0);
-    double dlon = (cos_lat > 1e-6) ? range_nm / (60.0 * cos_lat) : 180.0;
-
-    auto [x0, y1] = LatLonToTile(lat + dlat, lon - dlon, z);
-    auto [x1, y0] = LatLonToTile(lat - dlat, lon + dlon, z);
-
+inline std::set<TileCoord> TilesForRect(double latMin, double lonMin, double latMax, double lonMax, int z) {
+    // NW corner has higher lat (lower y tile), SE corner has lower lat (higher y tile)
+    auto [x0, y0] = LatLonToTile(latMax, lonMin, z);
+    auto [x1, y1] = LatLonToTile(latMin, lonMax, z);
     std::set<TileCoord> tiles;
-    for (int tx = x0; tx <= x1; tx++) {
-        for (int ty = y1; ty <= y0; ty++) {
-            auto [nwLat, nwLon] = TileNWCorner(tx,     ty,     z);
-            auto [seLat, seLon] = TileNWCorner(tx + 1, ty + 1, z);
-            double clampedLat = std::max(seLat, std::min(lat, nwLat));
-            double clampedLon = std::max(nwLon, std::min(lon, seLon));
-            if (DistanceNm(lat, lon, clampedLat, clampedLon) <= range_nm)
-                tiles.insert({ z, tx, ty });
-        }
-    }
+    for (int tx = x0; tx <= x1; tx++)
+        for (int ty = y0; ty <= y1; ty++)
+            tiles.insert({ z, tx, ty });
     return tiles;
 }
 

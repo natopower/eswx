@@ -50,17 +50,10 @@ void WeatherRadarScreen::OnAsrContentToBeSaved() {
     sprintf_s(buf, "%d", m_btnPos.y);     SaveDataToAsr(ASR_BTN_Y,   "Weather Radar Button Y", buf);
 }
 
-std::vector<VisPoint> WeatherRadarScreen::CollectVisPoints() {
-    EuroScopePlugIn::CPosition ld, ru;
+bool WeatherRadarScreen::HasValidDisplayArea(EuroScopePlugIn::CPosition& ld, EuroScopePlugIn::CPosition& ru) {
     GetDisplayArea(&ld, &ru);
-    if ((ld.m_Latitude == 0.0 && ld.m_Longitude == 0.0) ||
-        (ru.m_Latitude == 0.0 && ru.m_Longitude == 0.0))
-        return {};
-    double centerLat = (ld.m_Latitude  + ru.m_Latitude)  / 2.0;
-    double centerLon = (ld.m_Longitude + ru.m_Longitude) / 2.0;
-    double rangeNm   = TileMath::DistanceNm(ld.m_Latitude, ld.m_Longitude,
-                                            ru.m_Latitude, ru.m_Longitude) / 2.0 + 30.0;
-    return {{ centerLat, centerLon, rangeNm }};
+    return !((ld.m_Latitude == 0.0 && ld.m_Longitude == 0.0) ||
+             (ru.m_Latitude == 0.0 && ru.m_Longitude == 0.0));
 }
 
 
@@ -117,21 +110,17 @@ void WeatherRadarScreen::OnRefresh(HDC hDC, int Phase) {
     { std::lock_guard<std::mutex> lk(m_frameMu); ts = m_frameTimestamp; }
     if (ts == 0) return;
 
-    std::vector<VisPoint> visPoints = CollectVisPoints();
-    if (visPoints.empty()) return;
-
     EuroScopePlugIn::CPosition dispLD, dispRU;
-    GetDisplayArea(&dispLD, &dispRU);
+    if (!HasValidDisplayArea(dispLD, dispRU)) return;
+
     double screenWidthNm = TileMath::DistanceNm(dispLD.m_Latitude, dispLD.m_Longitude,
                                                  dispLD.m_Latitude, dispRU.m_Longitude);
     int zoom = TileMath::RangeToZoom(screenWidthNm);
 
     std::set<TileCacheKey> neededKeys;
-    for (auto& vp : visPoints) {
-        auto tiles = TileMath::TilesForCircle(vp.lat, vp.lon, vp.range_nm, zoom);
-        for (auto& tc : tiles)
-            neededKeys.insert({ tc, ts });
-    }
+    for (auto& tc : TileMath::TilesForRect(dispLD.m_Latitude, dispLD.m_Longitude,
+                                            dispRU.m_Latitude, dispRU.m_Longitude, zoom))
+        neededKeys.insert({ tc, ts });
 
     {
         std::lock_guard<std::mutex> lk(m_fetchMu);
@@ -159,25 +148,36 @@ void WeatherRadarScreen::OnRefresh(HDC hDC, int Phase) {
     Gdiplus::ImageAttributes attrs;
     attrs.SetColorMatrix(&cm, Gdiplus::ColorMatrixFlagsDefault, Gdiplus::ColorAdjustTypeBitmap);
 
-    auto renderTile = [&](const TileCacheKey& key, Gdiplus::Bitmap* bmp) {
+    // Returns pixel rect for a tile, or empty rect if degenerate
+    auto tilePixelRect = [&](const TileCacheKey& key) -> std::pair<POINT, POINT> {
         auto [nwLat, nwLon] = TileMath::TileNWCorner(key.coord.x,     key.coord.y,     key.coord.z);
         auto [seLat, seLon] = TileMath::TileNWCorner(key.coord.x + 1, key.coord.y + 1, key.coord.z);
         EuroScopePlugIn::CPosition posNW, posSE;
         posNW.m_Latitude = nwLat; posNW.m_Longitude = nwLon;
         posSE.m_Latitude = seLat; posSE.m_Longitude = seLon;
-        POINT ptNW = ConvertCoordFromPositionToPixel(posNW);
-        POINT ptSE = ConvertCoordFromPositionToPixel(posSE);
-        int w = ptSE.x - ptNW.x;
-        int h = ptSE.y - ptNW.y;
-        if (w <= 0 || h <= 0) return;
-        Gdiplus::Rect destRect(ptNW.x, ptNW.y, w, h);
-        g.DrawImage(bmp, destRect, 0, 0, bmp->GetWidth(), bmp->GetHeight(),
-                    Gdiplus::UnitPixel, &attrs);
+        return { ConvertCoordFromPositionToPixel(posNW), ConvertCoordFromPositionToPixel(posSE) };
     };
 
+    // First pass: faint "no precip" fill for every tile in the viewport
+    BYTE bgAlpha = (BYTE)(alpha * 0.25f);
+    Gdiplus::SolidBrush bgBrush(Gdiplus::Color(bgAlpha, 0, 18, 45));
+    for (auto& key : neededKeys) {
+        auto [ptNW, ptSE] = tilePixelRect(key);
+        int w = ptSE.x - ptNW.x, h = ptSE.y - ptNW.y;
+        if (w > 0 && h > 0)
+            g.FillRectangle(&bgBrush, Gdiplus::Rect(ptNW.x, ptNW.y, w, h));
+    }
+
+    // Second pass: precipitation data on top
     for (auto& key : neededKeys) {
         Gdiplus::Bitmap* bmp = m_tileCache.Get(key);
-        if (bmp) renderTile(key, bmp);
+        if (!bmp) continue;
+        auto [ptNW, ptSE] = tilePixelRect(key);
+        int w = ptSE.x - ptNW.x, h = ptSE.y - ptNW.y;
+        if (w <= 0 || h <= 0) continue;
+        g.DrawImage(bmp, Gdiplus::Rect(ptNW.x, ptNW.y, w, h),
+                    0, 0, (INT)bmp->GetWidth(), (INT)bmp->GetHeight(),
+                    Gdiplus::UnitPixel, &attrs);
     }
 
     m_tileCache.EvictOldTimestamps(ts);

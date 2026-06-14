@@ -72,7 +72,7 @@ std::string RainViewer::TileUrl(int z, int x, int y) const {
     if (!HasFrame()) return {};
     std::ostringstream ss;
     ss << "https://tilecache.rainviewer.com" << m_frame.path
-       << "/256/" << z << "/" << x << "/" << y << "/6/0_0.png";
+       << "/256/" << z << "/" << x << "/" << y << "/6/1_1.png";
     return ss.str();
 }
 
