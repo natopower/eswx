@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Program Files/**)",
+      "Read(//c/Program Files \\(x86\\)/**)",
+      "Read(//c//**)",
+      "PowerShell(git -C \"c:\\\\laragon\\\\www\\\\eswx\" show HEAD:Package/WeatherRadarPlugin.dll > \"c:\\\\laragon\\\\www\\\\eswx\\\\Package\\\\WeatherRadarPlugin.dll\" 2>&1; $?)",
+      "PowerShell(git -C \"c:\\\\laragon\\\\www\\\\eswx\" log --oneline -10)",
+      "PowerShell(git -C \"c:\\\\laragon\\\\www\\\\eswx\" tag)",
+      "PowerShell(git -C \"c:\\\\laragon\\\\www\\\\eswx\" show HEAD:Package/WeatherRadarPlugin-z7-radar-fix.zip > \"c:\\\\laragon\\\\www\\\\eswx\\\\Package\\\\temp_old.zip\" 2>&1; if \\(Test-Path \"c:\\\\laragon\\\\www\\\\eswx\\\\Package\\\\temp_old.zip\"\\) { Add-Type -AssemblyName System.IO.Compression.FileSystem; $zip = [System.IO.Compression.ZipFile]::OpenRead\\(\"c:\\\\laragon\\\\www\\\\eswx\\\\Package\\\\temp_old.zip\"\\); $zip.Entries | Select-Object FullName, Length; $zip.Dispose\\(\\) })",
+      "PowerShell(git -C \"c:\\\\laragon\\\\www\\\\eswx\" show HEAD:.gitattributes 2>$null)",
+      "PowerShell(Get-Item \"c:\\\\laragon\\\\www\\\\eswx\\\\Package\\\\WeatherRadarPlugin.dll\" | Select-Object Name, @{N='Size';E={\"{0:N0} bytes\" -f $_.Length}}, LastWriteTime)",
+      "PowerShell(& \"C:\\\\Program Files \\(x86\\)\\\\Microsoft Visual Studio\\\\18\\\\BuildTools\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe\" \"c:\\\\laragon\\\\www\\\\eswx\\\\WeatherRadarPlugin.vcxproj\" /p:Configuration=Release /p:Platform=Win32 /v:minimal)",
+      "PowerShell(& \"C:\\\\Program Files \\(x86\\)\\\\Microsoft Visual Studio\\\\18\\\\BuildTools\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe\" \"c:\\\\laragon\\\\www\\\\eswx\\\\WeatherRadarPlugin.vcxproj\" /p:Configuration=Release /p:Platform=Win32 /p:PlatformToolset=v180 /v:minimal)",
+      "Read(//c/laragon/www/eswx/Toolset/**)",
+      "PowerShell(& \"C:\\\\Program Files \\(x86\\)\\\\Microsoft Visual Studio\\\\18\\\\BuildTools\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe\" \"c:\\\\laragon\\\\www\\\\eswx\\\\WeatherRadarPlugin.vcxproj\" /p:Configuration=Release /p:Platform=Win32 /p:PlatformToolset=v145 /v:minimal 2>&1)",
+      "PowerShell(& \"C:\\\\Program Files \\(x86\\)\\\\Microsoft Visual Studio\\\\18\\\\BuildTools\\\\VC\\\\Tools\\\\MSVC\\\\14.51.36231\\\\bin\\\\Hostx64\\\\x64\\\\dumpbin.exe\" /exports \"C:\\\\Program Files \\(x86\\)\\\\EuroScope\\\\EuroScopePlugInDll.dll\" | Select-String \"^\\\\s+\\\\d\" | ForEach-Object { \\($_.Line -split '\\\\s+'\\)[4] } | Where-Object { $_ })",
+      "PowerShell(& \"C:\\\\Program Files \\(x86\\)\\\\Microsoft Visual Studio\\\\18\\\\BuildTools\\\\VC\\\\Tools\\\\MSVC\\\\14.51.36231\\\\bin\\\\Hostx64\\\\x86\\\\lib.exe\" /def:\"c:\\\\laragon\\\\www\\\\eswx\\\\SDK\\\\EuroScopePlugInDll.def\" /machine:x86 /out:\"c:\\\\laragon\\\\www\\\\eswx\\\\SDK\\\\EuroScopePlugInDll.lib\" 2>&1)",
+      "PowerShell(Copy-Item \"c:\\\\laragon\\\\www\\\\eswx\\\\Release\\\\WeatherRadarPlugin.dll\" \"c:\\\\laragon\\\\www\\\\eswx\\\\Package\\\\WeatherRadarPlugin.dll\" -Force; Get-Item \"c:\\\\laragon\\\\www\\\\eswx\\\\Package\\\\WeatherRadarPlugin.dll\" | Select-Object Name, @{N='Size';E={\"{0:N0} bytes\" -f $_.Length}}, LastWriteTime)"
+    ]
+  }
+}

@@ -57,8 +57,7 @@ inline std::set<TileCoord> TilesForRect(double latMin, double lonMin, double lat
 inline int RangeToZoom(double range_nm) {
     if (range_nm > 600) return 4;
     if (range_nm > 300) return 5;
-    if (range_nm > 150) return 6;
-    return 7;
+    return 6; // zoom 7 causes boundary gaps on non-Mercator projections; 6 is sufficient
 }
 
 }

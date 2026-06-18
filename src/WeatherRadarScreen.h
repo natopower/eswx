@@ -43,7 +43,6 @@ public:
     int  GetOpacity() const { return m_opacity; }
 
 private:
-    bool HasValidDisplayArea(EuroScopePlugIn::CPosition& ld, EuroScopePlugIn::CPosition& ru);
     static Gdiplus::Bitmap* DecodePng(const std::vector<uint8_t>& bytes);
     void FetchWorker();
     void DrawPanel(HDC hDC);

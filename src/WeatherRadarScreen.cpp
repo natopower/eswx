@@ -50,12 +50,6 @@ void WeatherRadarScreen::OnAsrContentToBeSaved() {
     sprintf_s(buf, "%d", m_btnPos.y);     SaveDataToAsr(ASR_BTN_Y,   "Weather Radar Button Y", buf);
 }
 
-bool WeatherRadarScreen::HasValidDisplayArea(EuroScopePlugIn::CPosition& ld, EuroScopePlugIn::CPosition& ru) {
-    GetDisplayArea(&ld, &ru);
-    return !((ld.m_Latitude == 0.0 && ld.m_Longitude == 0.0) ||
-             (ru.m_Latitude == 0.0 && ru.m_Longitude == 0.0));
-}
-
 
 void WeatherRadarScreen::OnRefresh(HDC hDC, int Phase) {
     if (Phase == EuroScopePlugIn::REFRESH_PHASE_AFTER_LISTS) {
@@ -110,16 +104,20 @@ void WeatherRadarScreen::OnRefresh(HDC hDC, int Phase) {
     { std::lock_guard<std::mutex> lk(m_frameMu); ts = m_frameTimestamp; }
     if (ts == 0) return;
 
+    // EuroScope's GetDisplayArea gives the true geographic bounding box of whatever
+    // is visible — correct for any projection or display rotation.
     EuroScopePlugIn::CPosition dispLD, dispRU;
-    if (!HasValidDisplayArea(dispLD, dispRU)) return;
+    GetDisplayArea(&dispLD, &dispRU);
+    if (dispLD.m_Latitude >= dispRU.m_Latitude || dispLD.m_Longitude >= dispRU.m_Longitude) return;
 
     double screenWidthNm = TileMath::DistanceNm(dispLD.m_Latitude, dispLD.m_Longitude,
                                                  dispLD.m_Latitude, dispRU.m_Longitude);
     int zoom = TileMath::RangeToZoom(screenWidthNm);
 
     std::set<TileCacheKey> neededKeys;
-    for (auto& tc : TileMath::TilesForRect(dispLD.m_Latitude, dispLD.m_Longitude,
-                                            dispRU.m_Latitude, dispRU.m_Longitude, zoom))
+    for (auto& tc : TileMath::TilesForRect(
+            dispLD.m_Latitude, dispLD.m_Longitude,
+            dispRU.m_Latitude, dispRU.m_Longitude, zoom))
         neededKeys.insert({ tc, ts });
 
     {
@@ -148,35 +146,84 @@ void WeatherRadarScreen::OnRefresh(HDC hDC, int Phase) {
     Gdiplus::ImageAttributes attrs;
     attrs.SetColorMatrix(&cm, Gdiplus::ColorMatrixFlagsDefault, Gdiplus::ColorAdjustTypeBitmap);
 
-    // Returns pixel rect for a tile, or empty rect if degenerate
-    auto tilePixelRect = [&](const TileCacheKey& key) -> std::pair<POINT, POINT> {
+    // In LCC projection (common in Canadian ATC) the same longitude maps to
+    // different screen-X at different latitudes, so computing each tile's pixel
+    // bounds from its own geographic corners produces overlapping destination
+    // rects at tile boundaries (visible as doubled-opacity seams).
+    // Fix: use the viewport centre lat/lon as the reference latitude/longitude
+    // when computing X and Y pixel extents respectively.  All horizontally
+    // adjacent tiles evaluate their shared longitude at the same midLat →
+    // identical boundary pixel.  Vertically adjacent tiles do the same with
+    // midLon.  Source subrects are still computed in pure Mercator space so the
+    // correct portion of each tile image is drawn.
+    auto mercY = [](double lat) -> double {
+        double r = lat * TileMath::PI / 180.0;
+        return log(tan(r) + 1.0 / cos(r));
+    };
+    double midLat = (dispLD.m_Latitude  + dispRU.m_Latitude)  * 0.5;
+    double midLon = (dispLD.m_Longitude + dispRU.m_Longitude) * 0.5;
+
+    auto tileRect = [&](const TileCacheKey& key,
+                        INT& srcX, INT& srcY, INT& srcW, INT& srcH) -> std::pair<POINT, POINT> {
         auto [nwLat, nwLon] = TileMath::TileNWCorner(key.coord.x,     key.coord.y,     key.coord.z);
         auto [seLat, seLon] = TileMath::TileNWCorner(key.coord.x + 1, key.coord.y + 1, key.coord.z);
-        EuroScopePlugIn::CPosition posNW, posSE;
-        posNW.m_Latitude = nwLat; posNW.m_Longitude = nwLon;
-        posSE.m_Latitude = seLat; posSE.m_Longitude = seLon;
-        return { ConvertCoordFromPositionToPixel(posNW), ConvertCoordFromPositionToPixel(posSE) };
+
+        double isLonMin = std::max(nwLon, dispLD.m_Longitude);
+        double isLonMax = std::min(seLon, dispRU.m_Longitude);
+        double isLatMin = std::max(seLat, dispLD.m_Latitude);
+        double isLatMax = std::min(nwLat, dispRU.m_Latitude);
+        if (isLonMin >= isLonMax || isLatMin >= isLatMax) return { {0,0},{0,0} };
+
+        // Source subrect within the 256x256 tile image (Web Mercator)
+        double mNW = mercY(nwLat), mSE = mercY(seLat), mRange = mNW - mSE;
+        INT sx0 = (INT)((isLonMin - nwLon) / (seLon - nwLon) * 256.0 + 0.5);
+        INT sx1 = (INT)((isLonMax - nwLon) / (seLon - nwLon) * 256.0 + 0.5);
+        INT sy0 = (INT)((mNW - mercY(isLatMax)) / mRange * 256.0 + 0.5);
+        INT sy1 = (INT)((mNW - mercY(isLatMin)) / mRange * 256.0 + 0.5);
+        srcX = sx0; srcY = sy0;
+        srcW = std::max(1, sx1 - sx0);
+        srcH = std::max(1, sy1 - sy0);
+
+        // Destination pixel rect: evaluate horizontal extent at midLat so that
+        // all tiles use the same reference latitude for their shared longitude
+        // boundary, and vertical extent at midLon for the same reason.
+        EuroScopePlugIn::CPosition cL, cR, cT, cB;
+        cL.m_Latitude = midLat;   cL.m_Longitude = isLonMin;
+        cR.m_Latitude = midLat;   cR.m_Longitude = isLonMax;
+        cT.m_Latitude = isLatMax; cT.m_Longitude = midLon;
+        cB.m_Latitude = isLatMin; cB.m_Longitude = midLon;
+        POINT ptL = ConvertCoordFromPositionToPixel(cL);
+        POINT ptR = ConvertCoordFromPositionToPixel(cR);
+        POINT ptT = ConvertCoordFromPositionToPixel(cT);
+        POINT ptB = ConvertCoordFromPositionToPixel(cB);
+        LONG x0 = std::min(ptL.x, ptR.x), x1 = std::max(ptL.x, ptR.x);
+        LONG y0 = std::min(ptT.y, ptB.y), y1 = std::max(ptT.y, ptB.y);
+        return { {x0, y0}, {x1, y1} };
     };
 
-    // First pass: faint "no precip" fill for every tile in the viewport
+    // First pass: faint "no precip" fill for every tile in the viewport.
+    // +1 on w/h so adjacent tiles overlap by 1 px and fill the corner pixel
+    // that GDI+ Rect(x,y,w,h) excludes at its right/bottom edges.
     BYTE bgAlpha = (BYTE)(alpha * 0.25f);
     Gdiplus::SolidBrush bgBrush(Gdiplus::Color(bgAlpha, 0, 18, 45));
     for (auto& key : neededKeys) {
-        auto [ptNW, ptSE] = tilePixelRect(key);
+        INT sx, sy, sw, sh;
+        auto [ptNW, ptSE] = tileRect(key, sx, sy, sw, sh);
         int w = ptSE.x - ptNW.x, h = ptSE.y - ptNW.y;
         if (w > 0 && h > 0)
-            g.FillRectangle(&bgBrush, Gdiplus::Rect(ptNW.x, ptNW.y, w, h));
+            g.FillRectangle(&bgBrush, Gdiplus::Rect(ptNW.x, ptNW.y, w + 2, h + 2));
     }
 
     // Second pass: precipitation data on top
     for (auto& key : neededKeys) {
         Gdiplus::Bitmap* bmp = m_tileCache.Get(key);
         if (!bmp) continue;
-        auto [ptNW, ptSE] = tilePixelRect(key);
+        INT srcX, srcY, srcW, srcH;
+        auto [ptNW, ptSE] = tileRect(key, srcX, srcY, srcW, srcH);
         int w = ptSE.x - ptNW.x, h = ptSE.y - ptNW.y;
         if (w <= 0 || h <= 0) continue;
-        g.DrawImage(bmp, Gdiplus::Rect(ptNW.x, ptNW.y, w, h),
-                    0, 0, (INT)bmp->GetWidth(), (INT)bmp->GetHeight(),
+        g.DrawImage(bmp, Gdiplus::Rect(ptNW.x, ptNW.y, w + 2, h + 2),
+                    srcX, srcY, srcW, srcH,
                     Gdiplus::UnitPixel, &attrs);
     }
 
